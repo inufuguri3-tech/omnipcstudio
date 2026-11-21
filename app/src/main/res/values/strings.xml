@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">OmniLive</string>
+    <string name="accessibility_service_label">OmniLive AI スマホ操作エージェント</string>
+    <string name="accessibility_service_description">Gemini AI が画面上のUI要素を読み取り、ユーザーの指示に応じてタップ・スクロール・文字入力・戻るなどの操作を代行します。操作はアプリ内のコマンド実行時のみ行われます。</string>
+    <string name="nav_live_pro">Live Pro</string>
+    <string name="nav_operator">スマホ操作</string>
+    <string name="nav_pc_operator">PC操作</string>
+    <string name="nav_history">履歴・設定</string>
+    <string name="firebase_auth_badge">Firebase AI Logic 接続済み（APIキー不要）</string>
+    <string name="accessibility_enabled">ユーザー補助: 有効（操作可能）</string>
+    <string name="accessibility_disabled">ユーザー補助: 未有効（設定でONにしてください）</string>
+    <string name="open_accessibility_settings">ユーザー補助設定を開く</string>
+    <string name="emergency_stop">緊急停止</string>
+</resources>

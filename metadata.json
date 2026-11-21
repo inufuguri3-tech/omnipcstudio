@@ -1,0 +1,6 @@
+{
+  "name": "OmniLive",
+  "description": "多機能なGemini Live Pro音声・ビジョン対話と、ユーザー補助機能（AccessibilityService）によるスマホ自律操作を備えたAIアシスタントアプリ。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
