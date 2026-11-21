@@ -44,20 +44,26 @@ import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.OpenInBrowser
+import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
@@ -81,9 +87,11 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.clickable
@@ -127,12 +135,20 @@ fun LiveProScreen(
     val speechState by viewModel.speechState.collectAsStateWithLifecycle()
     val isSpeaking by viewModel.isSpeaking.collectAsStateWithLifecycle()
     val prefs by viewModel.preferences.collectAsStateWithLifecycle()
+    val pcSaveResult by viewModel.pcSaveResult.collectAsStateWithLifecycle()
 
     var inputText by rememberSaveable { mutableStateOf("") }
     var showCameraPreview by rememberSaveable { mutableStateOf(false) }
     var showModelPicker by rememberSaveable { mutableStateOf(false) }
     val activeModel = AiModelOption.fromId(prefs.selectedLiveModelId)
     val listState = rememberLazyListState()
+
+    LaunchedEffect(pcSaveResult) {
+        pcSaveResult?.let { msg ->
+            Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+            viewModel.clearPcSaveResult()
+        }
+    }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -401,7 +417,11 @@ fun LiveProScreen(
                     LiveMessageBubble(
                         message = message,
                         onSpeak = { viewModel.speakText(message.text) },
-                        onCopy = { copyToClipboard(context, message.text) }
+                        onCopy = { copyToClipboard(context, message.text) },
+                        onCopyCode = { code -> copyToClipboard(context, code) },
+                        onSaveCodeToPc = { filename, code, openInBrowser ->
+                            viewModel.saveCodeBlockToPc(filename, code, openInBrowser)
+                        }
                     )
                 }
 
@@ -416,6 +436,8 @@ fun LiveProScreen(
                             ),
                             onSpeak = {},
                             onCopy = {},
+                            onCopyCode = {},
+                            onSaveCodeToPc = { _, _, _ -> },
                             isStreaming = true
                         )
                     }
@@ -663,6 +685,10 @@ private fun EmptyLiveStarterCard(
                     "カメラや画像で写したものの手順をガイドして",
                     "画面のエラーメッセージの直し方を教えて"
                 )
+                LiveProMode.CODE_ARCHITECT -> listOf(
+                    "ブラウザですぐ遊べるネオン色のシューティングHTMLゲームを1ファイルで作って",
+                    "フォルダ内のファイルを整理するPythonスクリプトを書いて"
+                )
             }
             samples.forEachIndexed { idx, sample ->
                 AssistChip(
@@ -687,14 +713,89 @@ private fun EmptyLiveStarterCard(
     }
 }
 
+private sealed interface MessageSegment {
+    data class TextPart(val text: String) : MessageSegment
+    data class CodePart(val language: String, val filename: String, val code: String) : MessageSegment
+}
+
+private val CODE_BLOCK_REGEX = Regex("```([A-Za-z0-9_+.-]*)\\s*\\n([\\s\\S]*?)```")
+private val FILENAME_HINT_REGEX = Regex("(?im)^\\s*(?:FILENAME|FILE)\\s*:\\s*([A-Za-z0-9._-]+)")
+
+private fun inferExtensionForLang(lang: String): String {
+    return when (lang.lowercase()) {
+        "html", "htm" -> "html"
+        "python", "py" -> "py"
+        "javascript", "js" -> "js"
+        "css" -> "css"
+        "kotlin", "kt" -> "kt"
+        "swift" -> "swift"
+        "json" -> "json"
+        "xml" -> "xml"
+        "markdown", "md" -> "md"
+        else -> "txt"
+    }
+}
+
+private fun parseMessageCodeSegments(raw: String): List<MessageSegment> {
+    val hintedFilename = FILENAME_HINT_REGEX.find(raw)?.groupValues?.getOrNull(1)?.trim()
+    val matches = CODE_BLOCK_REGEX.findAll(raw).toList()
+    if (matches.isEmpty()) {
+        return listOf(MessageSegment.TextPart(raw))
+    }
+
+    val segments = mutableListOf<MessageSegment>()
+    var cursor = 0
+    matches.forEachIndexed { idx, match ->
+        if (match.range.first > cursor) {
+            val before = raw.substring(cursor, match.range.first).trim()
+            if (before.isNotEmpty()) {
+                segments.add(MessageSegment.TextPart(before))
+            }
+        }
+        val lang = match.groupValues.getOrNull(1)?.trim().orEmpty().ifBlank { "txt" }
+        val code = match.groupValues.getOrNull(2)?.trimEnd().orEmpty()
+        val ext = inferExtensionForLang(lang)
+        val defaultName = if (idx == 0 && !hintedFilename.isNullOrBlank()) {
+            hintedFilename
+        } else {
+            "omnilive_app_${idx + 1}.$ext"
+        }
+        segments.add(
+            MessageSegment.CodePart(
+                language = lang,
+                filename = defaultName,
+                code = code
+            )
+        )
+        cursor = match.range.last + 1
+    }
+    if (cursor < raw.length) {
+        val after = raw.substring(cursor).trim()
+        if (after.isNotEmpty()) {
+            segments.add(MessageSegment.TextPart(after))
+        }
+    }
+    return segments
+}
+
 @Composable
 private fun LiveMessageBubble(
     message: LiveMessageEntity,
     onSpeak: () -> Unit,
     onCopy: () -> Unit,
+    onCopyCode: (String) -> Unit,
+    onSaveCodeToPc: (filename: String, code: String, openInBrowser: Boolean) -> Unit,
     isStreaming: Boolean = false
 ) {
     val isUser = message.role == "USER"
+    val segments = remember(message.text, isUser, isStreaming) {
+        if (isUser || isStreaming) {
+            listOf(MessageSegment.TextPart(message.text))
+        } else {
+            parseMessageCodeSegments(message.text)
+        }
+    }
+
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
@@ -711,7 +812,7 @@ private fun LiveMessageBubble(
                 1.dp,
                 if (isUser) ElectricCyan.copy(alpha = 0.45f) else ObsidianOutline
             ),
-            modifier = Modifier.widthIn(max = 540.dp)
+            modifier = Modifier.widthIn(max = 560.dp)
         ) {
             Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                 Row(
@@ -733,35 +834,169 @@ private fun LiveMessageBubble(
                         Row {
                             IconButton(
                                 onClick = onSpeak,
-                                modifier = Modifier.size(32.dp)
+                                modifier = Modifier.minimumInteractiveComponentSize()
                             ) {
                                 Icon(
                                     imageVector = Icons.AutoMirrored.Filled.VolumeUp,
                                     contentDescription = "読み上げる",
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(18.dp)
                                 )
                             }
                             IconButton(
                                 onClick = onCopy,
-                                modifier = Modifier.size(32.dp)
+                                modifier = Modifier.minimumInteractiveComponentSize()
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.ContentCopy,
                                     contentDescription = "コピー",
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(18.dp)
                                 )
                             }
                         }
                     }
                 }
                 Spacer(modifier = Modifier.height(4.dp))
+                segments.forEachIndexed { idx, segment ->
+                    when (segment) {
+                        is MessageSegment.TextPart -> {
+                            Text(
+                                text = segment.text,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        is MessageSegment.CodePart -> {
+                            if (idx > 0) Spacer(modifier = Modifier.height(8.dp))
+                            GeneratedCodeBlockCard(
+                                segment = segment,
+                                onCopyCode = { onCopyCode(segment.code) },
+                                onSaveToPc = { onSaveCodeToPc(segment.filename, segment.code, false) },
+                                onOpenInPcBrowser = { onSaveCodeToPc(segment.filename, segment.code, true) }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GeneratedCodeBlockCard(
+    segment: MessageSegment.CodePart,
+    onCopyCode: () -> Unit,
+    onSaveToPc: () -> Unit,
+    onOpenInPcBrowser: () -> Unit
+) {
+    val isHtml = segment.filename.endsWith(".html", ignoreCase = true) ||
+        segment.filename.endsWith(".htm", ignoreCase = true) ||
+        segment.language.equals("html", ignoreCase = true)
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = ObsidianBg),
+        shape = RoundedCornerShape(14.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.35f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp)
+    ) {
+        Column(modifier = Modifier.padding(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Code,
+                        contentDescription = null,
+                        tint = ElectricCyan,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "${segment.filename} (${segment.language.uppercase()})",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = ElectricCyan,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                IconButton(
+                    onClick = onCopyCode,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("copy_code_block_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ContentCopy,
+                        contentDescription = "コードをコピー",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(ObsidianSurface)
+                    .horizontalScroll(rememberScrollState())
+                    .padding(10.dp)
+            ) {
                 Text(
-                    text = message.text,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurface
+                    text = segment.code,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                    color = Color(0xFFE2E8F0)
                 )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onSaveToPc,
+                    modifier = Modifier
+                        .weight(1f)
+                        .minimumInteractiveComponentSize()
+                        .testTag("save_code_pc_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.SaveAlt,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("PCへ保存", style = MaterialTheme.typography.labelMedium)
+                }
+
+                if (isHtml) {
+                    FilledTonalButton(
+                        onClick = onOpenInPcBrowser,
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = EmeraldPulse.copy(alpha = 0.22f),
+                            contentColor = EmeraldPulse
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("open_html_pc_browser_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.OpenInBrowser,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("PCで開く", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
             }
         }
     }

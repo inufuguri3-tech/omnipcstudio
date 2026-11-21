@@ -17,6 +17,7 @@ import json
 import os
 import platform
 import queue
+import re
 import socket
 import subprocess
 import sys
@@ -55,6 +56,18 @@ PORT = int(os.environ.get("OMNILIVE_PC_PORT", "8765"))
 PAIRING_TOKEN = os.environ.get("OMNILIVE_PC_TOKEN", "").strip()
 
 LOG_QUEUE: "queue.Queue[str]" = queue.Queue()
+STATUS_QUEUE: "queue.Queue[str]" = queue.Queue()
+
+BRIDGE_LOCK = threading.Lock()
+BRIDGE_TASK = {
+    "hasGoal": False,
+    "goalId": "",
+    "goal": "",
+    "status": "idle",
+    "cancelRequested": False,
+    "lastPollAt": 0.0,
+    "lastMessage": "",
+}
 
 
 def emit_log(msg: str) -> None:
@@ -196,6 +209,41 @@ def execute_pc_action(data: dict) -> tuple[bool, str]:
     return False, f"Unsupported actionType: {action}"
 
 
+ALLOWED_SAVE_EXTS = {
+    ".html", ".htm", ".py", ".js", ".css", ".txt", ".md", ".json", ".kt", ".swift", ".csv", ".xml"
+}
+
+
+def save_generated_file(filename: str, content: str, open_in_browser: bool = False) -> tuple[bool, str]:
+    if not isinstance(content, str) or not content.strip():
+        return False, "空のコードは保存できません。"
+    if len(content.encode("utf-8")) > 512 * 1024:
+        return False, "ファイルサイズ上限 (512KB) を超えています。"
+
+    raw_name = os.path.basename(str(filename).strip()) or "generated_code.txt"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name)
+    stem, ext = os.path.splitext(safe_name)
+    if ext.lower() not in ALLOWED_SAVE_EXTS:
+        safe_name = f"{stem or 'generated_code'}.txt"
+        ext = ".txt"
+
+    out_dir = os.path.join(os.path.expanduser("~"), "OmniLiveGenerated")
+    os.makedirs(out_dir, exist_ok=True)
+    target_path = os.path.abspath(os.path.join(out_dir, safe_name))
+    if not target_path.startswith(os.path.abspath(out_dir) + os.sep):
+        return False, "無効なファイル名です。"
+
+    with open(target_path, "w", encoding="utf-8") as fp:
+        fp.write(content)
+
+    opened_msg = ""
+    if open_in_browser and ext.lower() in (".html", ".htm"):
+        webbrowser.open(f"file://{target_path}")
+        opened_msg = "（ブラウザで開きました）"
+
+    return True, f"保存完了: {target_path} {opened_msg}".strip()
+
+
 class AgentHandler(BaseHTTPRequestHandler):
     def _authorized(self) -> bool:
         if not PAIRING_TOKEN:
@@ -235,6 +283,12 @@ class AgentHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json(500, {"error": str(exc)})
             return
+        if self.path == "/pending-goal":
+            with BRIDGE_LOCK:
+                BRIDGE_TASK["lastPollAt"] = time.time()
+                snapshot = dict(BRIDGE_TASK)
+            self._send_json(200, snapshot)
+            return
         self._send_json(404, {"error": "Not found"})
 
     def do_POST(self):
@@ -252,9 +306,50 @@ class AgentHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json(500, {"success": False, "detail": str(exc)})
             return
+        if self.path == "/ack-goal":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length).decode("utf-8")
+            try:
+                data = json.loads(raw)
+                goal_id = str(data.get("goalId", ""))
+                status = str(data.get("status", "step"))
+                message = str(data.get("message", ""))
+                with BRIDGE_LOCK:
+                    if not goal_id or BRIDGE_TASK["goalId"] == goal_id:
+                        BRIDGE_TASK["status"] = status
+                        BRIDGE_TASK["lastMessage"] = message
+                        if status == "claimed":
+                            BRIDGE_TASK["hasGoal"] = False
+                        elif status in ("completed", "error", "cancelled"):
+                            BRIDGE_TASK["hasGoal"] = False
+                            BRIDGE_TASK["cancelRequested"] = False
+                if message:
+                    emit_log(f"[APK連携:{status}] {message}")
+                    STATUS_QUEUE.put(message)
+                self._send_json(200, {"ok": True})
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if self.path == "/save-file":
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length).decode("utf-8")
+            try:
+                data = json.loads(raw)
+                ok, detail = save_generated_file(
+                    filename=str(data.get("filename", "generated.txt")),
+                    content=str(data.get("content", "")),
+                    open_in_browser=bool(data.get("openInBrowser", False)),
+                )
+                emit_log(f"Save generated file: {detail}")
+                self._send_json(200 if ok else 400, {"success": ok, "detail": detail})
+            except Exception as exc:
+                self._send_json(500, {"success": False, "detail": str(exc)})
+            return
         self._send_json(404, {"error": "Not found"})
 
     def log_message(self, format, *args):
+        if "/pending-goal" in (format % args):
+            return
         emit_log(f"HTTP {format % args}")
 
 
@@ -265,6 +360,31 @@ def extract_json_object(raw: str) -> dict:
     if start >= 0 and end > start:
         text = text[start : end + 1]
     return json.loads(text)
+
+
+def _urlopen_json(req: urllib.request.Request, timeout: int = 45, is_local: bool = False) -> dict:
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError:
+        raise
+    except urllib.error.URLError as exc:
+        if not is_local:
+            # Retry bypassing any broken Windows localhost proxy setting
+            try:
+                no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with no_proxy_opener.open(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError:
+                raise
+            except Exception:
+                pass
+        reason_str = str(getattr(exc, "reason", exc))
+        if is_local and ("10061" in reason_str or "refused" in reason_str.lower()):
+            raise ConnectionError(
+                "ローカルLLM (Ollama) が起動していません。Ollama を起動するか、「APK連携AI (APIキー不要)」または「Gemini」へ切り替えてください。"
+            ) from exc
+        raise
 
 
 def request_ai_pc_plan(
@@ -301,7 +421,15 @@ Rules:
         key = api_key.strip() or os.environ.get("GEMINI_API_KEY", "").strip()
         if not key:
             raise ValueError("Gemini APIキーを入力するか環境変数 GEMINI_API_KEY を設定してください。")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
+        effective_model = model_name.strip()
+        if not effective_model or effective_model.startswith("gemini-1.") or effective_model.startswith("gemini-2."):
+            effective_model = "gemini-3.8-flash"
+
+        candidate_models = []
+        for candidate in (effective_model, "gemini-3.5-flash-lite", "gemini-3.8-flash"):
+            if candidate not in candidate_models:
+                candidate_models.append(candidate)
+
         body = {
             "contents": [
                 {
@@ -316,19 +444,41 @@ Rules:
                 "responseMimeType": "application/json",
             },
         }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return extract_json_object(raw_text)
+        payload_bytes = json.dumps(body).encode("utf-8")
+
+        last_http_err = None
+        for idx, candidate in enumerate(candidate_models):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate}:generateContent?key={key}"
+            for attempt in range(2):
+                req = urllib.request.Request(
+                    url,
+                    data=payload_bytes,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    data = _urlopen_json(req, timeout=45, is_local=False)
+                    raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    return extract_json_object(raw_text)
+                except urllib.error.HTTPError as exc:
+                    last_http_err = exc
+                    if exc.code in (429, 500, 502, 503, 504):
+                        emit_log(f"Gemini ({candidate}) HTTP {exc.code} 一時混雑/エラー。再試行・自動切替します...")
+                        if attempt == 0:
+                            time.sleep(1.5)
+                            continue
+                        break
+                    if exc.code == 404 and idx < len(candidate_models) - 1:
+                        emit_log(f"モデル {candidate} が利用不可 (404) のため次候補へ切り替えます...")
+                        break
+                    raise
+        if last_http_err is not None:
+            raise last_http_err
+        raise RuntimeError("Gemini API への接続に失敗しました。")
 
     if provider in ("ChatGPT (OpenAI)", "ローカルLLM (Ollama)"):
-        if provider == "ChatGPT (OpenAI)":
+        is_local = provider == "ローカルLLM (Ollama)"
+        if not is_local:
             key = api_key.strip() or os.environ.get("OPENAI_API_KEY", "").strip()
             if not key:
                 raise ValueError("OpenAI APIキーを入力するか環境変数 OPENAI_API_KEY を設定してください。")
@@ -352,7 +502,7 @@ Rules:
                 }
             ],
         }
-        if provider == "ChatGPT (OpenAI)":
+        if not is_local:
             body["response_format"] = {"type": "json_object"}
 
         req = urllib.request.Request(
@@ -361,8 +511,7 @@ Rules:
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        data = _urlopen_json(req, timeout=45, is_local=is_local)
         raw_text = data["choices"][0]["message"]["content"]
         return extract_json_object(raw_text)
 
@@ -401,8 +550,7 @@ Rules:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        data = _urlopen_json(req, timeout=45, is_local=False)
         raw_text = data["content"][0]["text"]
         return extract_json_object(raw_text)
 
@@ -411,11 +559,23 @@ Rules:
 
 class OmniLivePcGuiApp:
     PROVIDER_DEFAULTS = {
-        "Gemini": ("gemini-2.5-flash", "GEMINI_API_KEY"),
+        "APK連携AI (APIキー不要)": ("スマホ側 Firebase AI / 無制限AI", ""),
+        "Gemini (要APIキー)": ("gemini-3.8-flash", "GEMINI_API_KEY"),
         "ChatGPT (OpenAI)": ("gpt-4o-mini", "OPENAI_API_KEY"),
         "Claude (Anthropic)": ("claude-3-5-haiku-latest", "ANTHROPIC_API_KEY"),
         "ローカルLLM (Ollama)": ("gemma3", ""),
     }
+
+    MODEL_CHOICES = [
+        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-4-argon",
+        "gpt-4o-mini",
+        "gpt-4o",
+        "claude-3-5-haiku-latest",
+        "claude-sonnet-4-0",
+        "gemma3",
+    ]
 
     def __init__(self, root: "tk.Tk", server: ThreadingHTTPServer):
         self.root = root
@@ -480,7 +640,7 @@ class OmniLivePcGuiApp:
         # --- Left Column: AI Settings & Command ---
         ttk.Label(left_col, text="AI モデル設定", style="Card.TLabel", font=("Segoe UI", 11, "bold")).pack(anchor="w")
 
-        self.provider_var = tk.StringVar(value="Gemini")
+        self.provider_var = tk.StringVar(value="APK連携AI (APIキー不要)")
         provider_box = ttk.Combobox(
             left_col,
             textvariable=self.provider_var,
@@ -491,12 +651,12 @@ class OmniLivePcGuiApp:
         provider_box.bind("<<ComboboxSelected>>", self._on_provider_changed)
 
         ttk.Label(left_col, text="モデル名", style="Muted.TLabel").pack(anchor="w")
-        self.model_var = tk.StringVar(value="gemini-2.5-flash")
-        self.model_entry = tk.Entry(left_col, textvariable=self.model_var, bg="#090E1A", fg="#F8FAFC", insertbackground="#22D3EE")
+        self.model_var = tk.StringVar(value="スマホ側 Firebase AI / 無制限AI")
+        self.model_entry = ttk.Combobox(left_col, textvariable=self.model_var, values=self.MODEL_CHOICES)
         self.model_entry.pack(fill="x", pady=(2, 8))
 
-        ttk.Label(left_col, text="APIキー (未入力時は環境変数を使用 / Ollamaは不要)", style="Muted.TLabel").pack(anchor="w")
-        self.apikey_var = tk.StringVar(value=os.environ.get("GEMINI_API_KEY", ""))
+        ttk.Label(left_col, text="APIキー (APK連携・Ollamaでは入力不要)", style="Muted.TLabel").pack(anchor="w")
+        self.apikey_var = tk.StringVar(value="")
         self.apikey_entry = tk.Entry(left_col, textvariable=self.apikey_var, show="*", bg="#090E1A", fg="#F8FAFC", insertbackground="#22D3EE")
         self.apikey_entry.pack(fill="x", pady=(2, 8))
 
@@ -578,7 +738,7 @@ class OmniLivePcGuiApp:
 
         self.status_label = tk.Label(
             left_col,
-            text="待機中（コマンドを入力して開始してください）",
+            text="APIキー不要モード準備完了：スマホ側 OmniLive APK を開いて待機すると、PCからそのままAI操作できます。",
             bg="#1E293B",
             fg="#22D3EE",
             anchor="w",
@@ -658,6 +818,8 @@ class OmniLivePcGuiApp:
         self.model_var.set(default_model)
         if env_name:
             self.apikey_var.set(os.environ.get(env_name, ""))
+        else:
+            self.apikey_var.set("")
 
     def _set_goal(self, text: str) -> None:
         self.goal_entry.delete(0, "end")
@@ -697,13 +859,34 @@ class OmniLivePcGuiApp:
         if not goal:
             messagebox.showwarning("入力エラー", "実行したい指示を入力してください。")
             return
+
+        provider = self.provider_var.get()
+        if provider == "APK連携AI (APIキー不要)":
+            goal_id = str(int(time.time() * 1000))
+            with BRIDGE_LOCK:
+                BRIDGE_TASK["hasGoal"] = True
+                BRIDGE_TASK["goalId"] = goal_id
+                BRIDGE_TASK["goal"] = goal
+                BRIDGE_TASK["status"] = "pending"
+                BRIDGE_TASK["cancelRequested"] = False
+                BRIDGE_TASK["lastMessage"] = ""
+                online = (time.time() - BRIDGE_TASK["lastPollAt"]) < 6.0
+            emit_log(f"APK連携タスクを登録: {goal}")
+            if online:
+                self._set_status(f"スマホ側 OmniLive APK へ送信しました: 「{goal}」")
+            else:
+                self._set_status(
+                    f"待機中: スマホ側 OmniLive APK の「PC操作」タブで http://{get_lan_ip()}:{PORT} に接続すると自動で「{goal}」を実行します。"
+                )
+            return
+
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("実行中", "現在別の操作を実行中です。停止してから再実行してください。")
             return
 
         self.stop_event.clear()
         self.confirm_frame.pack_forget()
-        provider = self.provider_var.get()
+        api_provider = "Gemini" if provider.startswith("Gemini") else provider
         model = self.model_var.get().strip()
         api_key = self.apikey_var.get().strip()
         local_url = self.local_url_var.get().strip()
@@ -720,9 +903,9 @@ class OmniLivePcGuiApp:
                     snap = self._capture_with_optional_minimize()
                     self.root.after(0, lambda s=snap: self._update_preview(s))
 
-                    self._set_status(f"ステップ {step}/{max_steps}: {provider} が次の操作を計画中...")
+                    self._set_status(f"ステップ {step}/{max_steps}: {api_provider} が次の操作を計画中...")
                     plan = request_ai_pc_plan(
-                        provider=provider,
+                        provider=api_provider,
                         model_name=model,
                         api_key=api_key,
                         local_url=local_url,
@@ -779,8 +962,14 @@ class OmniLivePcGuiApp:
                 self._set_status("最大ステップ数に達したため終了しました。")
             except urllib.error.HTTPError as exc:
                 err_body = exc.read().decode("utf-8", errors="ignore")
-                emit_log(f"HTTP Error {exc.code}: {err_body[:200]}")
-                self._set_status(f"AI APIエラー (HTTP {exc.code}): {err_body[:120]}")
+                parsed_msg = err_body
+                try:
+                    err_json = json.loads(err_body)
+                    parsed_msg = err_json.get("error", {}).get("message", err_body)
+                except Exception:
+                    pass
+                emit_log(f"HTTP Error {exc.code}: {parsed_msg[:240]}")
+                self._set_status(f"AI APIエラー (HTTP {exc.code}): {parsed_msg[:140]}")
             except Exception as exc:
                 emit_log(f"Error: {exc}")
                 self._set_status(f"エラー: {exc}")
@@ -801,6 +990,10 @@ class OmniLivePcGuiApp:
         self.stop_event.set()
         self.confirm_approved = False
         self.confirm_event.set()
+        with BRIDGE_LOCK:
+            BRIDGE_TASK["hasGoal"] = False
+            BRIDGE_TASK["cancelRequested"] = True
+            BRIDGE_TASK["status"] = "cancelled"
         self._set_status("緊急停止しました。")
         emit_log("緊急停止ボタンが押されました。")
 
@@ -817,7 +1010,28 @@ class OmniLivePcGuiApp:
                 self.log_box.config(state="disabled")
             except queue.Empty:
                 break
-        self.root.after(150, self._poll_queues)
+        while not STATUS_QUEUE.empty():
+            try:
+                msg = STATUS_QUEUE.get_nowait()
+                self.status_label.config(text=msg)
+            except queue.Empty:
+                break
+        with BRIDGE_LOCK:
+            apk_online = (time.time() - BRIDGE_TASK["lastPollAt"]) < 5.0
+        lan_ip = get_lan_ip()
+        if apk_online:
+            self.server_badge.config(
+                text=f"APK連携オンライン: http://{lan_ip}:{PORT}",
+                bg="#065F46",
+                fg="#6EE7B7",
+            )
+        else:
+            self.server_badge.config(
+                text=f"スマホ連携待機中: http://{lan_ip}:{PORT}",
+                bg="#1E293B",
+                fg="#94A3B8",
+            )
+        self.root.after(200, self._poll_queues)
 
 
 def start_server() -> ThreadingHTTPServer:

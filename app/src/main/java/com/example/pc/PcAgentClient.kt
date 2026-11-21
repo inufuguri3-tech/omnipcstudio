@@ -21,6 +21,14 @@ data class PcHealthInfo(
     val activeWindow: String
 )
 
+data class PendingPcGoal(
+    val hasGoal: Boolean,
+    val goalId: String,
+    val goal: String,
+    val status: String,
+    val cancelRequested: Boolean
+)
+
 class PcAgentClient {
 
     private val client = OkHttpClient.Builder()
@@ -54,6 +62,56 @@ class PcAgentClient {
                 }
             }
         }
+
+    suspend fun pollPendingGoal(baseUrl: String, token: String): Result<PendingPcGoal> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val url = normalizeBaseUrl(baseUrl) + "/pending-goal"
+                val reqBuilder = Request.Builder().url(url).get()
+                if (token.isNotBlank()) {
+                    reqBuilder.header("X-OmniLive-Token", token.trim())
+                }
+                client.newCall(reqBuilder.build()).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        error("HTTP ${response.code}")
+                    }
+                    val json = JSONObject(body)
+                    PendingPcGoal(
+                        hasGoal = json.optBoolean("hasGoal", false),
+                        goalId = json.optString("goalId", ""),
+                        goal = json.optString("goal", ""),
+                        status = json.optString("status", "idle"),
+                        cancelRequested = json.optBoolean("cancelRequested", false)
+                    )
+                }
+            }
+        }
+
+    suspend fun reportGoalStatus(
+        baseUrl: String,
+        token: String,
+        goalId: String,
+        status: String,
+        message: String
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val url = normalizeBaseUrl(baseUrl) + "/ack-goal"
+            val payload = JSONObject().apply {
+                put("goalId", goalId)
+                put("status", status)
+                put("message", message)
+            }
+            val reqBuilder = Request.Builder()
+                .url(url)
+                .header("Content-Type", "application/json")
+                .post(payload.toString().toRequestBody(jsonMediaType))
+            if (token.isNotBlank()) {
+                reqBuilder.header("X-OmniLive-Token", token.trim())
+            }
+            client.newCall(reqBuilder.build()).execute().use { Unit }
+        }
+    }
 
     suspend fun captureScreen(baseUrl: String, token: String): Result<PcScreenSnapshot> =
         withContext(Dispatchers.IO) {
@@ -98,6 +156,39 @@ class PcAgentClient {
                 put("x", plan.x)
                 put("y", plan.y)
                 put("inputText", plan.inputText)
+            }
+            val reqBuilder = Request.Builder()
+                .url(url)
+                .header("Content-Type", "application/json")
+                .post(payload.toString().toRequestBody(jsonMediaType))
+            if (token.isNotBlank()) {
+                reqBuilder.header("X-OmniLive-Token", token.trim())
+            }
+            client.newCall(reqBuilder.build()).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                val json = runCatching { JSONObject(body) }.getOrNull()
+                val ok = response.isSuccessful && (json?.optBoolean("success", true) ?: true)
+                val detail = json?.optString("detail").orEmpty().ifBlank {
+                    body.ifBlank { "HTTP ${response.code}" }
+                }
+                ActionExecutionResult(success = ok, detail = detail)
+            }
+        }
+    }
+
+    suspend fun saveGeneratedFile(
+        baseUrl: String,
+        token: String,
+        filename: String,
+        content: String,
+        openInBrowser: Boolean = false
+    ): Result<ActionExecutionResult> = withContext(Dispatchers.IO) {
+        runCatching {
+            val url = normalizeBaseUrl(baseUrl) + "/save-file"
+            val payload = JSONObject().apply {
+                put("filename", filename)
+                put("content", content)
+                put("openInBrowser", openInBrowser)
             }
             val reqBuilder = Request.Builder()
                 .url(url)

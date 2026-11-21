@@ -9,35 +9,36 @@ if "%PY_CMD%"=="" (
 )
 
 if "%PY_CMD%"=="" (
-    echo [ERROR] Python 3 が見つかりませんでした。
-    echo https://www.python.org/downloads/ から Python をインストールし、「Add python.exe to PATH」にチェックを入れて再度実行してください。
+    echo [ERROR] Python 3 was not found on this PC.
+    echo Please install Python from https://www.python.org/downloads/
+    echo Check "Add python.exe to PATH" during installation, then run this file again.
     pause
     exit /b 1
 )
 
-echo [1/3] 必要ライブラリをインストールしています...
+echo [1/3] Installing required libraries...
 %PY_CMD% -m pip install --upgrade pip
 %PY_CMD% -m pip install -r requirements.txt
 if errorlevel 1 (
-    echo [ERROR] ライブラリのインストールに失敗しました。
+    echo [ERROR] Failed to install dependencies.
     pause
     exit /b 1
 )
 
-echo [2/3] OmniLivePCAgent.exe (GUI版) をビルドしています...
+echo [2/3] Building OmniLivePCAgent.exe (GUI)...
 %PY_CMD% -m PyInstaller --noconfirm --clean --onefile --windowed --name OmniLivePCAgent omnilive_pc_agent.py
 if errorlevel 1 (
-    echo [ERROR] .exe のビルドに失敗しました。
+    echo [ERROR] Failed to build OmniLivePCAgent.exe.
     pause
     exit /b 1
 )
 
-echo [3/3] 実行ファイルを配置しています...
+echo [3/3] Copying OmniLivePCAgent.exe to pc_agent folder...
 copy /y "dist\OmniLivePCAgent.exe" "OmniLivePCAgent.exe" >nul
 
 echo.
 echo ========================================================
-echo 完了: GUI版 OmniLivePCAgent.exe を作成しました！
-echo このフォルダの OmniLivePCAgent.exe をダブルクリックして起動できます。
+echo Done! OmniLivePCAgent.exe has been created.
+echo Double-click OmniLivePCAgent.exe in this folder to launch.
 echo ========================================================
 pause

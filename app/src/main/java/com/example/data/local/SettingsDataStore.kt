@@ -23,7 +23,8 @@ data class UserPreferences(
     val localEndpointUrl: String = "http://10.0.2.2:11434/v1/chat/completions",
     val localModelName: String = "gemma3",
     val pcAgentUrl: String = "http://192.168.1.10:8765",
-    val pcAgentToken: String = ""
+    val pcAgentToken: String = "",
+    val pcBridgeListenerEnabled: Boolean = true
 )
 
 class SettingsDataStore(private val context: Context) {
@@ -40,6 +41,7 @@ class SettingsDataStore(private val context: Context) {
         val LOCAL_MODEL_NAME = stringPreferencesKey("local_model_name")
         val PC_AGENT_URL = stringPreferencesKey("pc_agent_url")
         val PC_AGENT_TOKEN = stringPreferencesKey("pc_agent_token")
+        val PC_BRIDGE_LISTENER = booleanPreferencesKey("pc_bridge_listener_enabled")
     }
 
     val preferencesFlow: Flow<UserPreferences> = context.dataStore.data.map { prefs ->
@@ -55,7 +57,8 @@ class SettingsDataStore(private val context: Context) {
             localEndpointUrl = prefs[Keys.LOCAL_ENDPOINT_URL] ?: "http://10.0.2.2:11434/v1/chat/completions",
             localModelName = prefs[Keys.LOCAL_MODEL_NAME] ?: "gemma3",
             pcAgentUrl = prefs[Keys.PC_AGENT_URL] ?: "http://192.168.1.10:8765",
-            pcAgentToken = prefs[Keys.PC_AGENT_TOKEN] ?: ""
+            pcAgentToken = prefs[Keys.PC_AGENT_TOKEN] ?: "",
+            pcBridgeListenerEnabled = prefs[Keys.PC_BRIDGE_LISTENER] ?: true
         )
     }
 
@@ -113,5 +116,9 @@ class SettingsDataStore(private val context: Context) {
             it[Keys.PC_AGENT_URL] = url.trim()
             it[Keys.PC_AGENT_TOKEN] = token.trim()
         }
+    }
+
+    suspend fun setPcBridgeListenerEnabled(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.PC_BRIDGE_LISTENER] = enabled }
     }
 }

@@ -148,12 +148,19 @@ class OmniLiveViewModel(application: Application) : AndroidViewModel(application
     private val _pcActiveWindow = MutableStateFlow("")
     val pcActiveWindow: StateFlow<String> = _pcActiveWindow.asStateFlow()
 
+    private val _pcBridgeConnected = MutableStateFlow(false)
+    val pcBridgeConnected: StateFlow<Boolean> = _pcBridgeConnected.asStateFlow()
+
+    private val _pcSaveResult = MutableStateFlow<String?>(null)
+    val pcSaveResult: StateFlow<String?> = _pcSaveResult.asStateFlow()
+
     private var activeVoiceTarget = VoiceTarget.LIVE_PRO
     private var liveStreamJob: Job? = null
     private var operatorJob: Job? = null
     private var pcOperatorJob: Job? = null
     private var confirmationDeferred: CompletableDeferred<Boolean>? = null
     private var pcConfirmationDeferred: CompletableDeferred<Boolean>? = null
+    private var lastHandledBridgeGoalId: String = ""
 
     private val voiceController = VoiceController(application) { finalTranscript ->
         when (activeVoiceTarget) {
@@ -178,6 +185,53 @@ class OmniLiveViewModel(application: Application) : AndroidViewModel(application
                 if (stopRequested) {
                     cancelPhoneTask("ユーザーにより緊急停止されました。")
                 }
+            }
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                val prefs = preferences.value
+                if (prefs.pcBridgeListenerEnabled && prefs.pcAgentUrl.isNotBlank()) {
+                    pcAgentClient.pollPendingGoal(prefs.pcAgentUrl, prefs.pcAgentToken).fold(
+                        onSuccess = { pending ->
+                            _pcBridgeConnected.value = true
+                            _pcIsConnected.value = true
+                            if (pending.cancelRequested && pcOperatorJob?.isActive == true) {
+                                viewModelScope.launch(Dispatchers.Main) {
+                                    cancelPcTask("PC側の緊急停止により中止されました。")
+                                }
+                            } else if (
+                                pending.hasGoal &&
+                                pending.goal.isNotBlank() &&
+                                pending.goalId.isNotBlank() &&
+                                pending.goalId != lastHandledBridgeGoalId
+                            ) {
+                                lastHandledBridgeGoalId = pending.goalId
+                                pcAgentClient.reportGoalStatus(
+                                    baseUrl = prefs.pcAgentUrl,
+                                    token = prefs.pcAgentToken,
+                                    goalId = pending.goalId,
+                                    status = "claimed",
+                                    message = "スマホAPK側が受信しました。AI分析を開始します..."
+                                )
+                                viewModelScope.launch(Dispatchers.Main) {
+                                    _pcGoalInput.value = pending.goal
+                                    startPcTask(
+                                        goalRaw = pending.goal,
+                                        bridgeGoalId = pending.goalId,
+                                        skipPhoneConfirm = true
+                                    )
+                                }
+                            }
+                        },
+                        onFailure = {
+                            _pcBridgeConnected.value = false
+                        }
+                    )
+                } else {
+                    _pcBridgeConnected.value = false
+                }
+                delay(1_200L)
             }
         }
     }
@@ -566,6 +620,10 @@ class OmniLiveViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch { settingsStore.setPcAgentConfig(url, token) }
     }
 
+    fun setPcBridgeListenerEnabled(enabled: Boolean) {
+        viewModelScope.launch { settingsStore.setPcBridgeListenerEnabled(enabled) }
+    }
+
     fun updatePcGoal(goal: String) {
         _pcGoalInput.value = goal
     }
@@ -615,7 +673,11 @@ class OmniLiveViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun startPcTask(goalRaw: String) {
+    fun startPcTask(
+        goalRaw: String,
+        bridgeGoalId: String? = null,
+        skipPhoneConfirm: Boolean = false
+    ) {
         val goal = goalRaw.trim()
         if (goal.isBlank()) return
         val url = preferences.value.pcAgentUrl
@@ -628,6 +690,12 @@ class OmniLiveViewModel(application: Application) : AndroidViewModel(application
             try {
                 for (step in 1..maxSteps) {
                     _pcOperatorState.value = PcOperatorUiState.CapturingScreen(step, maxSteps)
+                    if (bridgeGoalId != null) {
+                        pcAgentClient.reportGoalStatus(
+                            url, token, bridgeGoalId, "step",
+                            "ステップ $step/$maxSteps: PC画面を解析中..."
+                        )
+                    }
                     val snapshot = pcAgentClient.captureScreen(url, token).getOrElse { err ->
                         _pcIsConnected.value = false
                         throw IllegalStateException(
@@ -680,6 +748,12 @@ class OmniLiveViewModel(application: Application) : AndroidViewModel(application
                                 success = true
                             )
                         )
+                        if (bridgeGoalId != null) {
+                            pcAgentClient.reportGoalStatus(
+                                url, token, bridgeGoalId, "completed",
+                                "完了: ${plan.reasoning}"
+                            )
+                        }
                         _pcOperatorState.value = PcOperatorUiState.Completed(plan.reasoning)
                         if (preferences.value.autoSpeakResponses) {
                             voiceController.speak(plan.speechFeedback)
@@ -687,7 +761,8 @@ class OmniLiveViewModel(application: Application) : AndroidViewModel(application
                         return@launch
                     }
 
-                    val needsConfirm = preferences.value.requireActionConfirmation || plan.requiresConfirmation
+                    val needsConfirm = !skipPhoneConfirm &&
+                        (preferences.value.requireActionConfirmation || plan.requiresConfirmation)
                     if (needsConfirm) {
                         val deferred = CompletableDeferred<Boolean>()
                         pcConfirmationDeferred = deferred
@@ -706,6 +781,12 @@ class OmniLiveViewModel(application: Application) : AndroidViewModel(application
                     }
 
                     _pcOperatorState.value = PcOperatorUiState.ExecutingAction(plan, step)
+                    if (bridgeGoalId != null) {
+                        pcAgentClient.reportGoalStatus(
+                            url, token, bridgeGoalId, "step",
+                            "ステップ $step: ${plan.actionType.name} を実行中 (${plan.reasoning})"
+                        )
+                    }
                     val execResult = pcAgentClient.executeAction(url, token, plan).getOrElse { err ->
                         throw IllegalStateException("PC操作送信エラー: ${err.localizedMessage}")
                     }
@@ -730,27 +811,37 @@ class OmniLiveViewModel(application: Application) : AndroidViewModel(application
                     takenSteps.add("Step $step: ${plan.actionType.name}($targetDesc) => ${execResult.detail}")
 
                     if (!execResult.success) {
-                        _pcOperatorState.value = PcOperatorUiState.Error(
-                            "ステップ $step でPC操作に失敗しました: ${execResult.detail}"
-                        )
+                        val errMsg = "ステップ $step でPC操作に失敗しました: ${execResult.detail}"
+                        if (bridgeGoalId != null) {
+                            pcAgentClient.reportGoalStatus(url, token, bridgeGoalId, "error", errMsg)
+                        }
+                        _pcOperatorState.value = PcOperatorUiState.Error(errMsg)
                         return@launch
                     }
 
                     delay(1_150L)
                 }
 
-                _pcOperatorState.value = PcOperatorUiState.Completed(
-                    "最大ステップ数（$maxSteps ステップ）に達したためPC操作を終了しました。"
-                )
+                val maxMsg = "最大ステップ数（$maxSteps ステップ）に達したためPC操作を終了しました。"
+                if (bridgeGoalId != null) {
+                    pcAgentClient.reportGoalStatus(url, token, bridgeGoalId, "completed", maxMsg)
+                }
+                _pcOperatorState.value = PcOperatorUiState.Completed(maxMsg)
             } catch (e: TimeoutCancellationException) {
-                _pcOperatorState.value = PcOperatorUiState.Error("PC操作プランの生成がタイムアウトしました。")
+                val errMsg = "PC操作プランの生成がタイムアウトしました。"
+                if (bridgeGoalId != null) {
+                    pcAgentClient.reportGoalStatus(url, token, bridgeGoalId, "error", errMsg)
+                }
+                _pcOperatorState.value = PcOperatorUiState.Error(errMsg)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "PC operator failed", e)
-                _pcOperatorState.value = PcOperatorUiState.Error(
-                    e.localizedMessage ?: "PC操作中にエラーが発生しました。"
-                )
+                val errMsg = e.localizedMessage ?: "PC操作中にエラーが発生しました。"
+                if (bridgeGoalId != null) {
+                    pcAgentClient.reportGoalStatus(url, token, bridgeGoalId, "error", errMsg)
+                }
+                _pcOperatorState.value = PcOperatorUiState.Error(errMsg)
             }
         }
     }
@@ -765,6 +856,37 @@ class OmniLiveViewModel(application: Application) : AndroidViewModel(application
         pcOperatorJob?.cancel()
         pcOperatorJob = null
         _pcOperatorState.value = PcOperatorUiState.Error(reason)
+    }
+
+    fun clearPcSaveResult() {
+        _pcSaveResult.value = null
+    }
+
+    fun saveCodeBlockToPc(
+        filename: String,
+        code: String,
+        openInBrowser: Boolean = false
+    ) {
+        val url = preferences.value.pcAgentUrl
+        val token = preferences.value.pcAgentToken
+        viewModelScope.launch {
+            pcAgentClient.saveGeneratedFile(
+                baseUrl = url,
+                token = token,
+                filename = filename,
+                content = code,
+                openInBrowser = openInBrowser
+            ).fold(
+                onSuccess = { res ->
+                    _pcSaveResult.value = res.detail.ifBlank {
+                        if (res.success) "PCに保存しました: $filename" else "PCへの保存に失敗しました"
+                    }
+                },
+                onFailure = { err ->
+                    _pcSaveResult.value = "PC接続エラー: ${err.localizedMessage ?: "PC側 OmniLivePCAgent を起動してください"}"
+                }
+            )
+        }
     }
 
     override fun onCleared() {

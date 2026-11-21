@@ -1,0 +1,49 @@
+name: Build iOS Companion IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios_app/**'
+      - '.github/workflows/build-ios-ipa.yml'
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        working-directory: ios_app
+        run: xcodegen generate
+
+      - name: Build Unsigned iOS Release App
+        working-directory: ios_app
+        run: |
+          xcodebuild \
+            -project OmniLiveIOS.xcodeproj \
+            -scheme OmniLiveIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package Unsigned .ipa
+        working-directory: ios_app
+        run: |
+          mkdir -p dist/Payload
+          cp -R build/Build/Products/Release-iphoneos/OmniLiveIOS.app dist/Payload/
+          cd dist
+          zip -r OmniLiveIOS-unsigned.ipa Payload
+
+      - name: Upload Unsigned .ipa Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniLiveIOS-unsigned-ipa
+          path: ios_app/dist/OmniLiveIOS-unsigned.ipa

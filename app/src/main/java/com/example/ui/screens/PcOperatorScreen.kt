@@ -120,6 +120,7 @@ fun PcOperatorScreen(
     val pcConnectionStatus by viewModel.pcConnectionStatus.collectAsStateWithLifecycle()
     val pcIsConnected by viewModel.pcIsConnected.collectAsStateWithLifecycle()
     val pcActiveWindow by viewModel.pcActiveWindow.collectAsStateWithLifecycle()
+    val pcBridgeConnected by viewModel.pcBridgeConnected.collectAsStateWithLifecycle()
     val operatorLogs by viewModel.operatorLogs.collectAsStateWithLifecycle()
 
     var urlInput by rememberSaveable(prefs.pcAgentUrl) { mutableStateOf(prefs.pcAgentUrl) }
@@ -306,6 +307,58 @@ fun PcOperatorScreen(
                                 Text("PC画面取得")
                             }
                         }
+                    }
+                }
+            }
+
+            // APK Bridge Listener Mode (API-keyless Firebase AI relay for PC GUI)
+            item {
+                val bridgeAccent = if (prefs.pcBridgeListenerEnabled && pcBridgeConnected) {
+                    EmeraldPulse
+                } else if (prefs.pcBridgeListenerEnabled) {
+                    ElectricCyan
+                } else {
+                    ObsidianOutline
+                }
+                Surface(
+                    color = if (prefs.pcBridgeListenerEnabled) bridgeAccent.copy(alpha = 0.12f) else ObsidianSurface,
+                    shape = RoundedCornerShape(18.dp),
+                    border = BorderStroke(1.dp, bridgeAccent.copy(alpha = 0.55f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text(
+                                text = if (pcBridgeConnected && prefs.pcBridgeListenerEnabled) {
+                                    "PC GUI連携ブリッジ: オンライン待機中"
+                                } else if (prefs.pcBridgeListenerEnabled) {
+                                    "PC GUI連携ブリッジ: ON（APIキー不要モード）"
+                                } else {
+                                    "PC GUI連携ブリッジ: OFF"
+                                },
+                                style = MaterialTheme.typography.titleMedium,
+                                color = if (prefs.pcBridgeListenerEnabled) bridgeAccent else MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "PC側の OmniLivePCAgent.exe で「APK連携AI (APIキー不要)」を選んで指示すると、このスマホの Firebase AI / 無制限AI がPC操作を自動代行します。",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = prefs.pcBridgeListenerEnabled,
+                            onCheckedChange = {
+                                viewModel.setPcAgentConfig(urlInput, tokenInput)
+                                viewModel.setPcBridgeListenerEnabled(it)
+                            },
+                            modifier = Modifier.testTag("pc_bridge_listener_switch")
+                        )
                     }
                 }
             }
